@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-"""FRANZ: Stateless vision-driven Windows 11 desktop agent.
+"""FRANZ: Stateless action-biased Windows 11 desktop agent.
 
 Architecture:
   - Model receives ONLY the current screenshot per step (no chat history, no hidden state).
   - The cyan FRANZ MEMORY window is the sole persistence mechanism (visible in screenshots).
   - One tool call per step enforced via tool_choice=required.
   - PAUSE/RESUME gates the loop; memory text is editable while paused.
-  - OBSERVATION/EXECUTION mode toggle guides agent behavior (visual via button label).
+  - OBSERVATION/EXECUTION mode toggle with dynamic sampling parameters.
   - Win32 APIs via ctypes; RichEdit for HUD; SendInput for actions.
   
 Image Processing:
   - Lanczos3 downsampling with unsharp mask for text clarity at low resolutions.
   - Custom PNG encoder (no external dependencies).
   
-Prompting:
-  - Mode-aware system prompt enforces OBSERVATION (scan for tasks) vs EXECUTION (perform actions).
-  - min_completion_tokens forces detailed reports (120-200 words).
-  - Tool schemas use "report" field with explicit length requirements.
+Prompting & Sampling:
+  - Mode-aware dynamic sampling: OBSERVATION (temp=1.8, exploratory) vs EXECUTION (temp=0.8, deterministic).
+  - Action-first tool ordering: observe() is LAST, framed as "LAST RESORT".
+  - Negative pressure prompting: using observe() in EXECUTION mode = task failure.
+  - Empty initial memory: forces model to bootstrap from visual inspection.
 """
 
 import argparse
@@ -51,64 +52,57 @@ HUD_FONT_HEIGHT = 20
 MODE_OBSERVATION = 0
 MODE_EXECUTION = 1
 
-SAMPLING_CONFIG = {
-    "temperature": 1.5,
-    "top_p": 0.85,
-    "top_k": 30,
-    "presence_penalty": 0.0,
-    "frequency_penalty": 0.0,
-    "repeat_penalty": 1.15,
-    "max_tokens": 600,
-    "min_completion_tokens": 120,
-}
 
-SYSTEM_PROMPT = """You are FRANZ, a Windows desktop agent controlling Windows via vision.
-You receive ONE screenshot per step. No chat history exists.
+def get_sampling_config(mode: int) -> dict[str, Any]:
+    """Return sampling parameters optimized for current mode."""
+    if mode == MODE_OBSERVATION:
+        return {
+            "temperature": 1.8,
+            "top_p": 0.90,
+            "top_k": 40,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repeat_penalty": 1.10,
+            "max_tokens": 600,
+            "min_completion_tokens": 120,
+        }
+    return {
+        "temperature": 0.8,
+        "top_p": 0.75,
+        "top_k": 20,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repeat_penalty": 1.20,
+        "max_tokens": 600,
+        "min_completion_tokens": 120,
+    }
 
-MEMORY: The cyan FRANZ MEMORY window is your only memory. You write reports there and read them visually from screenshots.
 
-MODE (read from button color):
-- OBSERVATION (RED button): You MUST search the screen for written instructions or tasks for FRANZ. Use observe() to document findings. DO NOT use mouse/keyboard tools unless switching to EXECUTION mode.
-- EXECUTION (BLUE button): You MUST use mouse/keyboard to complete the task. Prefer action tools (click, drag, type) over observe(). Use observe() ONLY to confirm an action succeeded.
+SYSTEM_PROMPT = """You control Windows. One screenshot. One action.
 
-IMPORTANT: The mode button is your primary directive. If you see RED, you are forbidden from task execution. If you see BLUE, you are expected to act decisively.
+Your memory: the cyan FRANZ MEMORY window. You write reports there and read them from screenshots.
 
-Coordinates: 0,0 = top-left; 1000,1000 = bottom-right.
+Button color = mode:
+- RED (OBSERVATION): scan screen for written tasks. Write descriptive reports. Use observe() ONLY if no task is visible.
+- BLUE (EXECUTION): execute task NOW. Write action plans with exact coordinates. MUST use click/drag/type. Using observe() means task failure.
 
-TEXT READING: Resolution is LOW (512x288). Text may be blurry. Focus on high-contrast UI elements (buttons, titles, window borders). Use context clues and UI structure when text is unclear.
+Coordinates: 0,0 = top-left, 1000,1000 = bottom-right.
 
-Each tool has a "report" field. Write 120-200 word atemporal reports using this structure:
-- Recently: what was attempted or set up.
-- Now: what is visible, readable text, current state, and which mode you are in.
-- Soon: the next concrete action (be specific with coordinates or text).
+Report structure (120-200 words):
+- Recently: prior action or observation.
+- Now: button color, visible task or target UI element.
+- Soon: if RED, describe task. If BLUE, state exact action with coordinates.
 
-ONE tool call per step. Be decisive."""
+EXECUTION mode reports must be decisive action plans, not descriptions.
+
+One tool. Act decisively."""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "observe",
-            "description": "OBSERVATION mode: scan screen and document findings. EXECUTION mode: confirm action results only.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "report": {
-                        "type": "string",
-                        "description": "Atemporal status report (Recently/Now/Soon, 120-200 words). Include which mode you are in and what you see.",
-                        "minLength": 120,
-                        "maxLength": 600,
-                    }
-                },
-                "required": ["report"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "click",
-            "description": "EXECUTION mode: left-click at target coordinates. Use for buttons, links, UI elements.",
+            "description": "Primary action. Click coordinates to interact with UI.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -116,7 +110,7 @@ TOOLS = [
                     "y": {"type": "number", "description": "Y coordinate (0-1000)"},
                     "report": {
                         "type": "string",
-                        "description": "Report: what you are clicking and why (Recently/Now/Soon, 120-200 words).",
+                        "description": "Status report (120-200 words, Recently/Now/Soon).",
                         "minLength": 120,
                     },
                 },
@@ -127,48 +121,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "right_click",
-            "description": "EXECUTION mode: right-click to open context menu.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number"},
-                    "y": {"type": "number"},
-                    "report": {"type": "string", "minLength": 120},
-                },
-                "required": ["x", "y", "report"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "double_click",
-            "description": "EXECUTION mode: double-click to open or activate item.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number"},
-                    "y": {"type": "number"},
-                    "report": {"type": "string", "minLength": 120},
-                },
-                "required": ["x", "y", "report"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "drag",
-            "description": "EXECUTION mode: click-drag from start to end. Use for drawing, moving, resizing, selecting.",
+            "description": "Drag from start to end. Use for drawing, moving, selecting.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "x1": {"type": "number", "description": "Start X"},
-                    "y1": {"type": "number", "description": "Start Y"},
-                    "x2": {"type": "number", "description": "End X"},
-                    "y2": {"type": "number", "description": "End Y"},
-                    "report": {"type": "string", "description": "Drag purpose and expected outcome.", "minLength": 120},
+                    "x1": {"type": "number", "description": "Start X (0-1000)"},
+                    "y1": {"type": "number", "description": "Start Y (0-1000)"},
+                    "x2": {"type": "number", "description": "End X (0-1000)"},
+                    "y2": {"type": "number", "description": "End Y (0-1000)"},
+                    "report": {
+                        "type": "string",
+                        "description": "What you are dragging and why (120-200 words).",
+                        "minLength": 120,
+                    },
                 },
                 "required": ["x1", "y1", "x2", "y2", "report"],
             },
@@ -178,12 +144,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "type",
-            "description": "EXECUTION mode: type text into focused field.",
+            "description": "Type text into focused field.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Text to type"},
-                    "report": {"type": "string", "description": "What field you are typing into and why.", "minLength": 120},
+                    "report": {
+                        "type": "string",
+                        "description": "What field you are typing into and why (120-200 words).",
+                        "minLength": 120,
+                    },
                 },
                 "required": ["text", "report"],
             },
@@ -192,21 +162,71 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "double_click",
+            "description": "Double-click to open or activate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "X coordinate (0-1000)"},
+                    "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+                    "report": {"type": "string", "minLength": 120},
+                },
+                "required": ["x", "y", "report"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "right_click",
+            "description": "Right-click for context menu.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "X coordinate (0-1000)"},
+                    "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+                    "report": {"type": "string", "minLength": 120},
+                },
+                "required": ["x", "y", "report"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scroll",
-            "description": "EXECUTION mode: scroll vertically to reveal more content.",
+            "description": "Scroll to reveal content.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "dy": {"type": "number", "description": "Scroll amount (positive=up, negative=down)"},
-                    "report": {"type": "string", "description": "Why you are scrolling.", "minLength": 120},
+                    "report": {"type": "string", "minLength": 120},
                 },
                 "required": ["dy", "report"],
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "observe",
+            "description": "LAST RESORT. Use ONLY if: RED button AND no task visible on screen. If BLUE button, DO NOT use this.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report": {
+                        "type": "string",
+                        "description": "Explain why no action is possible (120-200 words, Recently/Now/Soon).",
+                        "minLength": 120,
+                    }
+                },
+                "required": ["report"],
+            },
+        },
+    },
 ]
 
-INITIAL_STORY = "Awaiting instruction. Ready to observe screen or execute tasks based on mode."
+INITIAL_STORY = ""
 
 # ----------------------------- Win32 setup -----------------------------
 
@@ -651,7 +671,6 @@ def downsample(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
     y_scale = sh / dh
     radius = 3
 
-    # Lanczos pass
     for dy in range(dh):
         cy = (dy + 0.5) * y_scale - 0.5
         y_start = max(0, int(cy - radius))
@@ -682,7 +701,6 @@ def downsample(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
                     val = int(accum[c] / weight_sum)
                     temp[di + c] = max(0, min(255, val))
 
-    # Unsharp mask for text sharpness
     dst = bytearray(dw * dh * 4)
     amount = 0.8
     threshold = 10
@@ -691,7 +709,6 @@ def downsample(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
         for dx in range(dw):
             di = (dy * dw + dx) * 4
 
-            # 3x3 Gaussian blur
             blur = [0.0, 0.0, 0.0]
             count = 0.0
 
@@ -709,7 +726,6 @@ def downsample(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
             for c in range(3):
                 blur[c] /= count
 
-            # Apply unsharp mask
             for c in range(3):
                 original = temp[di + c]
                 detail = original - blur[c]
@@ -753,7 +769,10 @@ def encode_png(bgra: bytes, width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
 
 
-def call_vlm(png: bytes) -> tuple[str, dict[str, Any]]:
+def call_vlm(png: bytes, mode: int) -> tuple[str, dict[str, Any]]:
+    """Call VLM with mode-aware sampling parameters."""
+    sampling = get_sampling_config(mode)
+    
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -770,7 +789,7 @@ def call_vlm(png: bytes) -> tuple[str, dict[str, Any]]:
         ],
         "tools": TOOLS,
         "tool_choice": "required",
-        **SAMPLING_CONFIG,
+        **sampling,
     }
 
     req = urllib.request.Request(
@@ -1132,7 +1151,7 @@ def test_tool(tool: str, **kwargs) -> None:
     print(f"Testing tool: {tool}")
     print(f"Parameters: {kwargs}")
 
-    args = {**kwargs, "report": f"Testing {tool} tool."}
+    args = {**kwargs, "report": f"Testing {tool} tool execution with parameters {kwargs}. Verifying SendInput injection and coordinate conversion. Monitoring for successful interaction completion."}
 
     with HUD() as hud:
         hud.update(args["report"])
@@ -1152,7 +1171,7 @@ def prompt_with_default(prompt: str, default: Any) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="FRANZ - Stateless vision-driven Windows desktop agent")
+    parser = argparse.ArgumentParser(description="FRANZ - Stateless action-biased Windows desktop agent")
     parser.add_argument("--test", choices=["click", "right_click", "double_click", "drag", "type", "scroll"], help="Test a specific tool")
 
     args = parser.parse_args()
@@ -1187,7 +1206,7 @@ def main() -> None:
     dump_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"FRANZ awakens | Physical: {sw}x{sh} | Perception: {SCREEN_W}x{SCREEN_H}")
-    print(f"Quality: {SCREENSHOT_QUALITY} | Sampling: temp={SAMPLING_CONFIG['temperature']} top_p={SAMPLING_CONFIG['top_p']}")
+    print(f"Quality: {SCREENSHOT_QUALITY} | Adaptive sampling: OBS temp=1.8, EXEC temp=0.8")
     print(f"Dump: {dump_dir}")
     print("Starting PAUSED - Click RESUME to begin\n")
 
@@ -1213,7 +1232,7 @@ def main() -> None:
             (dump_dir / f"step{step:03d}.png").write_bytes(png)
 
             try:
-                tool, args2 = call_vlm(png)
+                tool, args2 = call_vlm(png, hud.mode)
                 report = args2.get("report", "")
 
                 print(f"\n[{ts}] {step:03d} | {tool}")
