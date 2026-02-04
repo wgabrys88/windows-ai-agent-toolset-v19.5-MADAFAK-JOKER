@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-"""FRANZ: Stateless action-biased Windows 11 desktop agent.
+"""FRANZ: Narrative-driven stateless Windows 11 desktop agent.
 
 Architecture:
   - Model receives ONLY the current screenshot per step (no chat history, no hidden state).
-  - The cyan FRANZ MEMORY window is the sole persistence mechanism (visible in screenshots).
+  - The cyan FRANZ MEMORY window contains the operation story—visible to the model in screenshots.
+  - The story is the only persistence: the model reads where it is in the narrative, then writes the next chapter.
   - One tool call per step enforced via tool_choice=required.
-  - PAUSE/RESUME gates the loop; memory text is editable while paused.
-  - OBSERVATION/EXECUTION mode toggle with dynamic sampling parameters.
+  - PAUSE/RESUME gates the loop; memory text is editable while paused (human can seed tasks).
   - Win32 APIs via ctypes; RichEdit for HUD; SendInput for actions.
   
 Image Processing:
@@ -15,10 +15,10 @@ Image Processing:
   - Custom PNG encoder (no external dependencies).
   
 Prompting & Sampling:
-  - Mode-aware dynamic sampling: OBSERVATION (temp=1.8, exploratory) vs EXECUTION (temp=0.8, deterministic).
-  - Action-first tool ordering: observe() is LAST, framed as "LAST RESORT".
-  - Negative pressure prompting: using observe() in EXECUTION mode = task failure.
-  - Empty initial memory: forces model to bootstrap from visual inspection.
+  - Story-aware dynamic sampling: exploratory (temp=1.8) when searching, deterministic (temp=0.8) when executing.
+  - Atemporal tool descriptions: "Advance story" instead of "act NOW".
+  - Story preamble visible in HUD teaches the model how to write narrative reports.
+  - No mode buttons: the story itself encodes whether we're searching or executing.
 """
 
 import argparse
@@ -46,16 +46,13 @@ SCREENSHOT_QUALITY = 2
 SCREEN_W, SCREEN_H = {1: (1536, 864), 2: (1024, 576), 3: (512, 288)}[SCREENSHOT_QUALITY]
 
 DUMP_FOLDER = Path("dump")
-HUD_SIZE = 1
 HUD_FONT_HEIGHT = 20
 
-MODE_OBSERVATION = 0
-MODE_EXECUTION = 1
 
-
-def get_sampling_config(mode: int) -> dict[str, Any]:
-    """Return sampling parameters optimized for current mode."""
-    if mode == MODE_OBSERVATION:
+def get_sampling_config(story: str) -> dict[str, Any]:
+    """Return sampling parameters based on story content."""
+    search_keywords = ["search", "scan", "no task", "looking for", "awaiting", "seeking"]
+    if any(word in story.lower() for word in search_keywords):
         return {
             "temperature": 1.8,
             "top_p": 0.90,
@@ -64,7 +61,7 @@ def get_sampling_config(mode: int) -> dict[str, Any]:
             "frequency_penalty": 0.0,
             "repeat_penalty": 1.10,
             "max_tokens": 600,
-            "min_completion_tokens": 120,
+            "min_completion_tokens": 150,
         }
     return {
         "temperature": 0.8,
@@ -74,35 +71,39 @@ def get_sampling_config(mode: int) -> dict[str, Any]:
         "frequency_penalty": 0.0,
         "repeat_penalty": 1.20,
         "max_tokens": 600,
-        "min_completion_tokens": 120,
+        "min_completion_tokens": 150,
     }
 
 
-SYSTEM_PROMPT = """You control Windows. One screenshot. One action.
+SYSTEM_PROMPT = """You are a character in a story. The cyan FRANZ MEMORY window contains the story so far. Read it. The screenshot shows the current scene. Your job: advance the story by one action. Write the next chapter in the report field."""
 
-Your memory: the cyan FRANZ MEMORY window. You write reports there and read them from screenshots.
+STORY_PREAMBLE = """FRANZ OPERATION LOG
 
-Button color = mode:
-- RED (OBSERVATION): scan screen for written tasks. Write descriptive reports. Use observe() ONLY if no task is visible.
-- BLUE (EXECUTION): execute task NOW. Write action plans with exact coordinates. MUST use click/drag/type. Using observe() means task failure.
+MISSION: Autonomous Windows desktop control via vision.
 
-Coordinates: 0,0 = top-left, 1000,1000 = bottom-right.
+MEMORY PROTOCOL: This cyan window is your only memory. You write the story. You read the story. The screenshot shows the current state.
 
-Report structure (120-200 words):
-- Recently: prior action or observation.
-- Now: button color, visible task or target UI element.
-- Soon: if RED, describe task. If BLUE, state exact action with coordinates.
+COORDINATES: 0,0 = top-left, 1000,1000 = bottom-right.
 
-EXECUTION mode reports must be decisive action plans, not descriptions.
+REPORT STRUCTURE:
+- CHAPTER SUMMARY: What has been accomplished so far.
+- CURRENT SCENE: What is visible on screen, what state the desktop is in.
+- NEXT ACTION: The one specific action that advances the story.
 
-One tool. Act decisively."""
+YOU ARE A CHARACTER IN THIS STORY. Find where you are in the timeline. Decide the next action that makes narrative sense. Do not repeat previous actions unless the story explicitly requires it.
+
+---
+
+STORY BEGINS:
+
+"""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "click",
-            "description": "Primary action. Click coordinates to interact with UI.",
+            "description": "Advance story: click coordinates.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -110,8 +111,8 @@ TOOLS = [
                     "y": {"type": "number", "description": "Y coordinate (0-1000)"},
                     "report": {
                         "type": "string",
-                        "description": "Status report (120-200 words, Recently/Now/Soon).",
-                        "minLength": 120,
+                        "description": "Story continuation (150-250 words). CHAPTER SUMMARY / CURRENT SCENE / NEXT ACTION.",
+                        "minLength": 150,
                     },
                 },
                 "required": ["x", "y", "report"],
@@ -122,7 +123,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "drag",
-            "description": "Drag from start to end. Use for drawing, moving, selecting.",
+            "description": "Advance story: drag from start to end.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -130,11 +131,7 @@ TOOLS = [
                     "y1": {"type": "number", "description": "Start Y (0-1000)"},
                     "x2": {"type": "number", "description": "End X (0-1000)"},
                     "y2": {"type": "number", "description": "End Y (0-1000)"},
-                    "report": {
-                        "type": "string",
-                        "description": "What you are dragging and why (120-200 words).",
-                        "minLength": 120,
-                    },
+                    "report": {"type": "string", "description": "Story continuation.", "minLength": 150},
                 },
                 "required": ["x1", "y1", "x2", "y2", "report"],
             },
@@ -144,16 +141,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "type",
-            "description": "Type text into focused field.",
+            "description": "Advance story: type text.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Text to type"},
-                    "report": {
-                        "type": "string",
-                        "description": "What field you are typing into and why (120-200 words).",
-                        "minLength": 120,
-                    },
+                    "report": {"type": "string", "minLength": 150},
                 },
                 "required": ["text", "report"],
             },
@@ -163,13 +156,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "double_click",
-            "description": "Double-click to open or activate.",
+            "description": "Advance story: double-click coordinates.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "x": {"type": "number", "description": "X coordinate (0-1000)"},
-                    "y": {"type": "number", "description": "Y coordinate (0-1000)"},
-                    "report": {"type": "string", "minLength": 120},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "report": {"type": "string", "minLength": 150},
                 },
                 "required": ["x", "y", "report"],
             },
@@ -179,13 +172,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "right_click",
-            "description": "Right-click for context menu.",
+            "description": "Advance story: right-click for context menu.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "x": {"type": "number", "description": "X coordinate (0-1000)"},
-                    "y": {"type": "number", "description": "Y coordinate (0-1000)"},
-                    "report": {"type": "string", "minLength": 120},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "report": {"type": "string", "minLength": 150},
                 },
                 "required": ["x", "y", "report"],
             },
@@ -195,12 +188,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "scroll",
-            "description": "Scroll to reveal content.",
+            "description": "Advance story: scroll to reveal content.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "dy": {"type": "number", "description": "Scroll amount (positive=up, negative=down)"},
-                    "report": {"type": "string", "minLength": 120},
+                    "report": {"type": "string", "minLength": 150},
                 },
                 "required": ["dy", "report"],
             },
@@ -210,14 +203,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "observe",
-            "description": "LAST RESORT. Use ONLY if: RED button AND no task visible on screen. If BLUE button, DO NOT use this.",
+            "description": "Advance story: document findings without action.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "report": {
                         "type": "string",
-                        "description": "Explain why no action is possible (120-200 words, Recently/Now/Soon).",
-                        "minLength": 120,
+                        "description": "Story continuation: what you see, why no action is taken yet.",
+                        "minLength": 150,
                     }
                 },
                 "required": ["report"],
@@ -225,8 +218,6 @@ TOOLS = [
         },
     },
 ]
-
-INITIAL_STORY = ""
 
 # ----------------------------- Win32 setup -----------------------------
 
@@ -245,7 +236,6 @@ try:
 except Exception:
     pass
 
-# Constants
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 WHEEL_DELTA = 120
@@ -269,7 +259,6 @@ WS_MINIMIZEBOX = 0x00020000
 WS_VISIBLE = 0x10000000
 WS_VSCROLL = 0x00200000
 WS_CHILD = 0x40000000
-WS_BORDER = 0x00800000
 
 ES_MULTILINE = 0x0004
 ES_AUTOVSCROLL = 0x0040
@@ -279,19 +268,11 @@ WS_EX_TOPMOST = 0x00000008
 WS_EX_LAYERED = 0x00080000
 
 BS_PUSHBUTTON = 0x00000000
-SS_CENTER = 0x00000001
-SS_NOTIFY = 0x00000100
-
-TBS_HORZ = 0x0000
-TBS_AUTOTICKS = 0x0001
 
 WM_SETFONT = 0x0030
-WM_SIZE = 0x0005
-WM_DESTROY = 0x0002
-WM_CTLCOLORSTATIC = 0x0138
 WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
-WM_HSCROLL = 0x0114
 
 EM_SETBKGNDCOLOR = 0x0443
 EM_SETREADONLY = 0x00CF
@@ -306,19 +287,10 @@ HWND_TOPMOST = -1
 SRCCOPY = 0x00CC0020
 LWA_ALPHA = 0x00000002
 
-TBM_GETPOS = 0x0400
-TBM_SETPOS = 0x0405
-TBM_SETRANGE = 0x0406
-
 CS_HREDRAW = 0x0002
 CS_VREDRAW = 0x0001
 IDC_ARROW = 32512
 COLOR_WINDOW = 5
-
-ICC_BAR_CLASSES = 0x00000004
-
-STN_CLICKED = 0
-STN_DBLCLK = 1
 
 HICON = w.HANDLE
 HCURSOR = w.HANDLE
@@ -413,20 +385,8 @@ class WNDCLASSEXW(ctypes.Structure):
     ]
 
 
-class INITCOMMONCONTROLSEX(ctypes.Structure):
-    _fields_ = [("dwSize", w.DWORD), ("dwICC", w.DWORD)]
-
-
-# Function signatures
-gdi32.CreateSolidBrush.argtypes = [w.COLORREF]
-gdi32.CreateSolidBrush.restype = w.HBRUSH
 gdi32.DeleteObject.argtypes = [w.HGDIOBJ]
 gdi32.DeleteObject.restype = w.BOOL
-gdi32.SetTextColor.argtypes = [w.HDC, w.COLORREF]
-gdi32.SetTextColor.restype = w.COLORREF
-gdi32.SetBkColor.argtypes = [w.HDC, w.COLORREF]
-gdi32.SetBkColor.restype = w.COLORREF
-
 user32.CreateWindowExW.argtypes = [
     w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int,
     ctypes.c_int, ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID,
@@ -466,14 +426,6 @@ user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
 user32.RegisterClassExW.restype = w.ATOM
 user32.LoadCursorW.argtypes = [w.HINSTANCE, w.LPCWSTR]
 user32.LoadCursorW.restype = HCURSOR
-user32.GetClientRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
-user32.GetClientRect.restype = w.BOOL
-user32.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
-user32.GetWindowRect.restype = w.BOOL
-user32.InvalidateRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT), w.BOOL]
-user32.InvalidateRect.restype = w.BOOL
-user32.MoveWindow.argtypes = [w.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.BOOL]
-user32.MoveWindow.restype = w.BOOL
 
 gdi32.CreateCompatibleDC.argtypes = [w.HDC]
 gdi32.CreateCompatibleDC.restype = w.HDC
@@ -493,8 +445,6 @@ gdi32.CreateFontW.restype = w.HFONT
 
 kernel32.GetModuleHandleW.argtypes = [w.LPCWSTR]
 kernel32.GetModuleHandleW.restype = w.HMODULE
-comctl32.InitCommonControlsEx.argtypes = [ctypes.POINTER(INITCOMMONCONTROLSEX)]
-comctl32.InitCommonControlsEx.restype = w.BOOL
 
 # ----------------------------- Helpers -----------------------------
 
@@ -769,9 +719,9 @@ def encode_png(bgra: bytes, width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
 
 
-def call_vlm(png: bytes, mode: int) -> tuple[str, dict[str, Any]]:
-    """Call VLM with mode-aware sampling parameters."""
-    sampling = get_sampling_config(mode)
+def call_vlm(png: bytes, current_story: str) -> tuple[str, dict[str, Any]]:
+    """Call VLM with story-aware sampling parameters."""
+    sampling = get_sampling_config(current_story)
     
     payload = {
         "model": MODEL_NAME,
@@ -820,12 +770,6 @@ class HUD:
     hwnd: w.HWND | None = None
     edit_hwnd: w.HWND | None = None
     button_hwnd: w.HWND | None = None
-    slider_hwnd: w.HWND | None = None
-    mode_hwnd: w.HWND | None = None
-
-    mode: int = field(default=MODE_OBSERVATION)
-    _mode_brush_obs: w.HBRUSH | None = None
-    _mode_brush_exec: w.HBRUSH | None = None
 
     thread: threading.Thread | None = None
     ready_event: threading.Event = field(default_factory=threading.Event)
@@ -835,57 +779,7 @@ class HUD:
     pause_event: threading.Event = field(default_factory=threading.Event)
 
     _wndproc_ref: Any = None
-
     _BTN_ID = 1001
-    _SLIDER_ID = 1002
-    _MODE_ID = 1003
-
-    def _mode_text(self) -> str:
-        return "EXECUTION" if self.mode == MODE_EXECUTION else "OBSERVATION"
-
-    def set_mode(self, new_mode: int) -> None:
-        self.mode = int(new_mode)
-        if self.mode_hwnd:
-            user32.SetWindowTextW(self.mode_hwnd, self._mode_text())
-            user32.InvalidateRect(self.mode_hwnd, None, True)
-
-    def _layout_controls(self) -> None:
-        if not self.hwnd or not self.edit_hwnd:
-            return
-
-        rc = w.RECT()
-        if not user32.GetClientRect(self.hwnd, ctypes.byref(rc)):
-            return
-
-        width = rc.right - rc.left
-        height = rc.bottom - rc.top
-
-        margin = 10
-        btn_h = 35
-        slider_h = 40
-
-        bottom_area = margin + btn_h + margin + slider_h + margin
-        edit_h = max(50, height - bottom_area)
-
-        user32.MoveWindow(self.edit_hwnd, margin, margin, max(50, width - 2 * margin), edit_h, True)
-
-        row_y = margin + edit_h + margin
-        if self.button_hwnd:
-            user32.MoveWindow(self.button_hwnd, margin, row_y, 150, btn_h, True)
-
-        mode_w = 260
-        if self.mode_hwnd:
-            user32.MoveWindow(self.mode_hwnd, max(margin, width - margin - mode_w), row_y, mode_w, btn_h, True)
-
-        if self.slider_hwnd:
-            user32.MoveWindow(
-                self.slider_hwnd,
-                margin,
-                row_y + btn_h + margin,
-                max(50, width - 2 * margin),
-                slider_h,
-                True,
-            )
 
     def _set_paused_ui(self, paused: bool) -> None:
         self.paused = paused
@@ -905,37 +799,9 @@ class HUD:
         try:
             if msg == WM_COMMAND:
                 cmd_id = int(wparam) & 0xFFFF
-                notify = (int(wparam) >> 16) & 0xFFFF
                 if cmd_id == self._BTN_ID:
                     self._set_paused_ui(not self.paused)
                     return 0
-                if cmd_id == self._MODE_ID and notify in (STN_CLICKED, STN_DBLCLK):
-                    self.set_mode(MODE_EXECUTION if self.mode == MODE_OBSERVATION else MODE_OBSERVATION)
-                    return 0
-
-            elif msg == WM_CTLCOLORSTATIC:
-                if self.mode_hwnd and int(lparam) == int(self.mode_hwnd):
-                    hdc = w.HDC(wparam)
-                    WHITE = w.COLORREF(0x00FFFFFF)
-                    RED = w.COLORREF(0x000000FF)
-                    BLUE = w.COLORREF(0x00FF0000)
-                    gdi32.SetTextColor(hdc, WHITE)
-                    if self.mode == MODE_EXECUTION:
-                        gdi32.SetBkColor(hdc, BLUE)
-                        return int(self._mode_brush_exec) if self._mode_brush_exec else 0
-                    gdi32.SetBkColor(hdc, RED)
-                    return int(self._mode_brush_obs) if self._mode_brush_obs else 0
-
-            elif msg == WM_HSCROLL:
-                if self.slider_hwnd and int(lparam) == int(self.slider_hwnd):
-                    pos = int(user32.SendMessageW(self.slider_hwnd, TBM_GETPOS, 0, 0))
-                    pos = max(20, min(255, pos))
-                    user32.SetLayeredWindowAttributes(self.hwnd, 0, ctypes.c_ubyte(pos), LWA_ALPHA)
-                    return 0
-
-            elif msg == WM_SIZE:
-                self._layout_controls()
-                return 0
 
             elif msg == WM_CLOSE:
                 self.stop_event.set()
@@ -945,15 +811,6 @@ class HUD:
             elif msg == WM_DESTROY:
                 self.stop_event.set()
                 self.pause_event.set()
-                try:
-                    if self._mode_brush_obs:
-                        gdi32.DeleteObject(w.HGDIOBJ(self._mode_brush_obs))
-                        self._mode_brush_obs = None
-                    if self._mode_brush_exec:
-                        gdi32.DeleteObject(w.HGDIOBJ(self._mode_brush_exec))
-                        self._mode_brush_exec = None
-                except Exception:
-                    pass
                 return 0
 
         except Exception as e:
@@ -967,14 +824,11 @@ class HUD:
     def _window_thread(self) -> None:
         hinst = kernel32.GetModuleHandleW(None)
 
-        icc = INITCOMMONCONTROLSEX(dwSize=ctypes.sizeof(INITCOMMONCONTROLSEX), dwICC=ICC_BAR_CLASSES)
-        comctl32.InitCommonControlsEx(ctypes.byref(icc))
-
         sw = user32.GetSystemMetrics(0)
         sh = user32.GetSystemMetrics(1)
 
-        win_w, win_h = (sw // 4, sh // 4) if HUD_SIZE == 0 else (480, 650)
-        win_x, win_y = (500, 500) if HUD_SIZE == 0 else (1400, 200)
+        win_w, win_h = 600, 800
+        win_x, win_y = sw - win_w - 50, 50
 
         self._wndproc_ref = WNDPROC(self._wndproc)
 
@@ -1021,7 +875,7 @@ class HUD:
         self.edit_hwnd = user32.CreateWindowExW(
             0, "RICHEDIT50W", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
-            10, 10, win_w - 40, win_h - 140,
+            10, 10, win_w - 40, win_h - 80,
             self.hwnd, None, hinst, None,
         )
 
@@ -1030,47 +884,19 @@ class HUD:
 
         CYAN = 0x00FFFF00
         user32.SendMessageW(self.edit_hwnd, EM_SETBKGNDCOLOR, 0, CYAN)
-        user32.SetWindowTextW(self.edit_hwnd, INITIAL_STORY)
+        user32.SetWindowTextW(self.edit_hwnd, STORY_PREAMBLE)
 
         self.button_hwnd = user32.CreateWindowExW(
             0, "BUTTON", "RESUME",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            10, win_h - 120, 150, 35,
+            10, win_h - 60, 150, 40,
             self.hwnd, w.HMENU(self._BTN_ID), hinst, None,
         )
 
         if self.button_hwnd and ui_font:
             user32.SendMessageW(self.button_hwnd, WM_SETFONT, ui_font, 1)
 
-        RED = w.COLORREF(0x000000FF)
-        BLUE = w.COLORREF(0x00FF0000)
-        self._mode_brush_obs = gdi32.CreateSolidBrush(RED)
-        self._mode_brush_exec = gdi32.CreateSolidBrush(BLUE)
-
-        self.mode_hwnd = user32.CreateWindowExW(
-            0, "STATIC", "OBSERVATION",
-            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY | WS_BORDER,
-            0, 0, 0, 0,
-            self.hwnd, w.HMENU(self._MODE_ID), hinst, None,
-        )
-        if self.mode_hwnd and ui_font:
-            user32.SendMessageW(self.mode_hwnd, WM_SETFONT, ui_font, 1)
-
-        self.set_mode(self.mode)
-
-        self.slider_hwnd = user32.CreateWindowExW(
-            0, "msctls_trackbar32", "",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
-            10, win_h - 70, win_w - 40, 40,
-            self.hwnd, w.HMENU(self._SLIDER_ID), hinst, None,
-        )
-
-        if self.slider_hwnd:
-            user32.SendMessageW(self.slider_hwnd, TBM_SETRANGE, 1, (255 << 16) | 20)
-            user32.SendMessageW(self.slider_hwnd, TBM_SETPOS, 1, 255)
-
         self._set_paused_ui(True)
-        self._layout_controls()
 
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
@@ -1108,9 +934,9 @@ class HUD:
         if self.thread:
             self.thread.join(timeout=1.0)
 
-    def update(self, report: str) -> None:
+    def update(self, story: str) -> None:
         if self.edit_hwnd:
-            user32.SetWindowTextW(self.edit_hwnd, report)
+            user32.SetWindowTextW(self.edit_hwnd, story)
         if self.hwnd:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
@@ -1119,7 +945,7 @@ class HUD:
             self.pause_event.wait(timeout=0.1)
 
 
-# ----------------------------- Tool execution / testing -----------------------------
+# ----------------------------- Tool execution -----------------------------
 
 
 def execute_tool_action(tool: str, args: dict[str, Any], conv: Coord) -> None:
@@ -1143,60 +969,12 @@ def execute_tool_action(tool: str, args: dict[str, Any], conv: Coord) -> None:
             scroll(float(args["dy"]))
 
 
-def test_tool(tool: str, **kwargs) -> None:
-    sw = user32.GetSystemMetrics(0)
-    sh = user32.GetSystemMetrics(1)
-    conv = Coord(sw=sw, sh=sh)
-
-    print(f"Testing tool: {tool}")
-    print(f"Parameters: {kwargs}")
-
-    args = {**kwargs, "report": f"Testing {tool} tool execution with parameters {kwargs}. Verifying SendInput injection and coordinate conversion. Monitoring for successful interaction completion."}
-
-    with HUD() as hud:
-        hud.update(args["report"])
-        hud._set_paused_ui(False)
-        time.sleep(1.0)
-        execute_tool_action(tool, args, conv)
-        time.sleep(1.0)
-        print(f"Tool {tool} executed")
-
-
-def prompt_with_default(prompt: str, default: Any) -> str:
-    response = input(f"{prompt} [{default}]: ").strip()
-    return response if response else str(default)
-
-
 # ----------------------------- Main -----------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="FRANZ - Stateless action-biased Windows desktop agent")
-    parser.add_argument("--test", choices=["click", "right_click", "double_click", "drag", "type", "scroll"], help="Test a specific tool")
-
+    parser = argparse.ArgumentParser(description="FRANZ - Narrative-driven stateless Windows desktop agent")
     args = parser.parse_args()
-
-    if args.test:
-        params: dict[str, Any] = {}
-        if args.test in ["click", "right_click", "double_click"]:
-            params = {
-                "x": float(prompt_with_default("X coordinate (0-1000)", 500)),
-                "y": float(prompt_with_default("Y coordinate (0-1000)", 500)),
-            }
-        elif args.test == "drag":
-            params = {
-                "x1": float(prompt_with_default("Start X (0-1000)", 400)),
-                "y1": float(prompt_with_default("Start Y (0-1000)", 400)),
-                "x2": float(prompt_with_default("End X (0-1000)", 600)),
-                "y2": float(prompt_with_default("End Y (0-1000)", 600)),
-            }
-        elif args.test == "type":
-            params = {"text": prompt_with_default("Text to type", "Hello FRANZ")}
-        elif args.test == "scroll":
-            params = {"dy": float(prompt_with_default("Scroll amount (positive=up, negative=down)", 240))}
-
-        test_tool(args.test, **params)
-        return
 
     sw = user32.GetSystemMetrics(0)
     sh = user32.GetSystemMetrics(1)
@@ -1206,12 +984,13 @@ def main() -> None:
     dump_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"FRANZ awakens | Physical: {sw}x{sh} | Perception: {SCREEN_W}x{SCREEN_H}")
-    print(f"Quality: {SCREENSHOT_QUALITY} | Adaptive sampling: OBS temp=1.8, EXEC temp=0.8")
+    print(f"Quality: {SCREENSHOT_QUALITY} | Story-aware adaptive sampling")
     print(f"Dump: {dump_dir}")
-    print("Starting PAUSED - Click RESUME to begin\n")
+    print("Starting PAUSED - Write task in HUD, then click RESUME\n")
 
     with HUD() as hud:
         step = 0
+        current_story = STORY_PREAMBLE
 
         hud.wait_for_resume()
         if hud.stop_event.is_set():
@@ -1232,13 +1011,15 @@ def main() -> None:
             (dump_dir / f"step{step:03d}.png").write_bytes(png)
 
             try:
-                tool, args2 = call_vlm(png, hud.mode)
-                report = args2.get("report", "")
+                tool, args2 = call_vlm(png, current_story)
+                new_chapter = args2.get("report", "")
 
                 print(f"\n[{ts}] {step:03d} | {tool}")
-                print(f"{report}\n")
+                print(f"{new_chapter}\n")
 
-                hud.update(report)
+                current_story = f"{STORY_PREAMBLE}\n\n{new_chapter}"
+                hud.update(current_story)
+
                 time.sleep(0.1)
 
                 if tool != "observe":
